@@ -31,6 +31,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.util.Log;
 
 import org.minidns.dnsserverlookup.android21.AndroidUsingLinkProperties;
@@ -69,6 +70,7 @@ import se.lublin.humla.protocol.ModelHandler;
 import se.lublin.humla.util.HumlaCallbacks;
 import se.lublin.humla.util.HumlaDisconnectedException;
 import se.lublin.humla.util.HumlaException;
+import se.lublin.humla.util.ConnectionRetryPolicy;
 import se.lublin.humla.util.HumlaLogger;
 import se.lublin.humla.util.IHumlaObserver;
 import se.lublin.humla.util.VoiceTargetMode;
@@ -91,6 +93,7 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
     public static final String EXTRAS_SERVER = "server";
     public static final String EXTRAS_AUTO_RECONNECT = "auto_reconnect";
     public static final String EXTRAS_AUTO_RECONNECT_DELAY = "auto_reconnect_delay";
+    public static final String EXTRAS_RECONNECT_ON_ALL_ERRORS = "reconnect_on_all_errors";
     public static final String EXTRAS_CERTIFICATE = "certificate";
     public static final String EXTRAS_CERTIFICATE_PASSWORD = "certificate_password";
     public static final String EXTRAS_DETECTION_THRESHOLD = "detection_threshold";
@@ -157,6 +160,9 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
     private ContinuousInputMode mContinuousInputMode;
 
     private boolean mReconnecting;
+    private boolean mReconnectOnAllErrors;
+    private int mConsecutiveReconnectAttempts;
+    private volatile long mLastAudioPacketSentElapsedRealtime;
 
     /**
      * Listen for connectivity changes in the reconnection state, and reconnect accordingly.
@@ -177,7 +183,26 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
             NetworkInfo info = cm.getActiveNetworkInfo();
             if (info != null && info.isConnected()) {
                 Log.v(TAG, "Connectivity restored, attempting reconnect.");
+                mHandler.removeCallbacks(mReconnectFallback);
                 connect();
+            }
+        }
+    };
+
+    /** Timer fallback for OEMs that fail to deliver the legacy connectivity broadcast. */
+    private final Runnable mReconnectFallback = new Runnable() {
+        @Override
+        public void run() {
+            if (!mReconnecting) {
+                return;
+            }
+            ConnectivityManager manager = (ConnectivityManager)
+                    getSystemService(CONNECTIVITY_SERVICE);
+            NetworkInfo network = manager == null ? null : manager.getActiveNetworkInfo();
+            if (network != null && network.isConnected()) {
+                connect();
+            } else {
+                mHandler.postDelayed(this, 60000L);
             }
         }
     };
@@ -188,6 +213,7 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
                 public void onAudioEncoded(byte[] data, int length) {
                     if(mConnection != null && mConnection.isSynchronized()) {
                         mConnection.sendUDPMessage(data, length, false);
+                        mLastAudioPacketSentElapsedRealtime = SystemClock.elapsedRealtime();
                     }
                 }
 
@@ -254,7 +280,9 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
             }
         }
 
-        return START_NOT_STICKY;
+        // Managed radios must recover after Android kills the service process. Redelivering the
+        // validated connection intent restores the same in-memory-only server/token configuration.
+        return mReconnectOnAllErrors ? START_REDELIVER_INTENT : START_NOT_STICKY;
     }
 
     @Override
@@ -319,7 +347,7 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
             mConnection.connect(mServer.getSrvHost(), mServer.getSrvPort());
         } catch (HumlaException e) {
             e.printStackTrace();
-            mCallbacks.onDisconnected(e);
+            onConnectionDisconnected(e);
         }
     }
 
@@ -365,6 +393,7 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
 
     @Override
     public void onConnectionSynchronized() {
+        mConsecutiveReconnectAttempts = 0;
         // early disconned?
         if (!mConnection.isConnected()) {
             return;
@@ -409,8 +438,8 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
             Log.e(TAG, "Error: " + e.getMessage() + " (reason: " + e.getReason().name() + ")");
             mConnectionState = ConnectionState.CONNECTION_LOST;
 
-            setReconnecting(mAutoReconnect
-                    && e.getReason() == HumlaException.HumlaDisconnectReason.CONNECTION_ERROR);
+            setReconnecting(ConnectionRetryPolicy.shouldRetry(mAutoReconnect,
+                    mReconnectOnAllErrors, e.getReason()));
         } else {
             Log.v(TAG, "Disconnected");
             mConnectionState = ConnectionState.DISCONNECTED;
@@ -467,13 +496,14 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
             NetworkInfo info = cm.getActiveNetworkInfo();
             if (info != null && info.isConnected()) {
                 Log.v(TAG, "Connection lost due to non-connectivity issue. Start reconnect polling.");
-                Handler mainHandler = new Handler();
-                mainHandler.postDelayed(new Runnable() {
+                long retryDelay = ConnectionRetryPolicy.retryDelayMs(mAutoReconnectDelay,
+                        mConsecutiveReconnectAttempts++, 60000L);
+                mHandler.postDelayed(new Runnable() {
                     @Override
                     public void run() {
                         if (mReconnecting) connect();
                     }
-                }, mAutoReconnectDelay);
+                }, retryDelay);
             } else {
                 // In the event that we've lost connectivity, don't poll. Wait until network
                 // returns before we resume connection attempts.
@@ -484,8 +514,11 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
                 } catch (IllegalArgumentException e) {
                     Log.e(TAG, "Error registering connectivity receiver: " + e.getMessage());
                 }
+                mHandler.removeCallbacks(mReconnectFallback);
+                mHandler.postDelayed(mReconnectFallback, 60000L);
             }
         } else {
+            mHandler.removeCallbacks(mReconnectFallback);
             try {
                 unregisterReceiver(mConnectivityReceiver);
             } catch (IllegalArgumentException e) {
@@ -540,6 +573,9 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
         }
         if (extras.containsKey(EXTRAS_AUTO_RECONNECT_DELAY)) {
             mAutoReconnectDelay = extras.getInt(EXTRAS_AUTO_RECONNECT_DELAY);
+        }
+        if (extras.containsKey(EXTRAS_RECONNECT_ON_ALL_ERRORS)) {
+            mReconnectOnAllErrors = extras.getBoolean(EXTRAS_RECONNECT_ON_ALL_ERRORS);
         }
         if (extras.containsKey(EXTRAS_CERTIFICATE)) {
             mCertificate = extras.getByteArray(EXTRAS_CERTIFICATE);
@@ -625,7 +661,7 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
         }
         if (extras.containsKey(EXTRAS_HALF_DUPLEX)) {
             mAudioBuilder.setHalfDuplexEnabled(
-                    extras.getInt(EXTRAS_TRANSMIT_MODE) == Constants.TRANSMIT_PUSH_TO_TALK
+                    mTransmitMode == Constants.TRANSMIT_PUSH_TO_TALK
                             && extras.getBoolean(EXTRAS_HALF_DUPLEX));
         }
         if (extras.containsKey(EXTRAS_LOCAL_MUTE_HISTORY)) {
@@ -931,6 +967,11 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
     @Override
     public boolean isTalking() {
         return mToggleInputMode.isTalkingOn();
+    }
+
+    /** Last time an encoded voice packet was handed to the synchronized connection. */
+    protected long getLastAudioPacketSentElapsedRealtime() {
+        return mLastAudioPacketSentElapsedRealtime;
     }
 
     @Override

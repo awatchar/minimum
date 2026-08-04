@@ -54,7 +54,7 @@ public class PreprocessingEncoder implements IEncoder {
 
         // Increase VAD difficulty
         arg.put(99);
-        mPreprocessor.control(Speex.SpeexPreprocessState.SPEEX_PREPROCESS_GET_PROB_START, arg);
+        mPreprocessor.control(Speex.SpeexPreprocessState.SPEEX_PREPROCESS_SET_PROB_START, arg);
     }
 
     @Override

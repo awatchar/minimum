@@ -331,6 +331,11 @@ public class AudioHandler extends HumlaNetworkListener implements AudioInput.Aud
      * Shuts down the audio handler, halting input and output.
      */
     public synchronized void shutdown() {
+        if (mHalfDuplex) {
+            // A disconnect can bypass the normal talking=false transition. Never leave the
+            // device's playback stream muted after the radio audio handler is torn down.
+            mAudioManager.setStreamMute(getAudioStream(), false);
+        }
         synchronized (mInput) {
             mInput.shutdown();
         }

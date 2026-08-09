@@ -29,4 +29,13 @@ public final class ConnectionRetryPolicy {
         }
         return Math.min(baseDelayMs * multiplier, maximumDelayMs);
     }
+
+    public static long remainingAttemptDelayMs(long minimumIntervalMs, long nowMs,
+                                               long lastAttemptMs) {
+        if (minimumIntervalMs <= 0L || lastAttemptMs < 0L || nowMs < lastAttemptMs) {
+            return 0L;
+        }
+        long elapsedMs = nowMs - lastAttemptMs;
+        return Math.max(0L, minimumIntervalMs - elapsedMs);
+    }
 }

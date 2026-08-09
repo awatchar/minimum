@@ -22,6 +22,7 @@ import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
+import android.content.SharedPreferences;
 import android.media.AudioManager;
 import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
@@ -77,6 +78,9 @@ import se.lublin.humla.util.VoiceTargetMode;
 
 public class HumlaService extends Service implements IHumlaService, IHumlaSession, HumlaConnection.HumlaConnectionListener, HumlaLogger, BluetoothScoReceiver.Listener {
     private static final String TAG = HumlaService.class.getName();
+    private static final String CONNECTION_GUARD_PREFERENCES = "humla_connection_guard";
+    private static final String PREF_LAST_CONNECTION_ATTEMPT_MS =
+            "last_connection_attempt_ms";
 
     static {
         // Use Spongy Castle for crypto implementation so we can create and manage PKCS #12 (.p12) certificates.
@@ -94,6 +98,9 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
     public static final String EXTRAS_AUTO_RECONNECT = "auto_reconnect";
     public static final String EXTRAS_AUTO_RECONNECT_DELAY = "auto_reconnect_delay";
     public static final String EXTRAS_RECONNECT_ON_ALL_ERRORS = "reconnect_on_all_errors";
+    public static final String EXTRAS_REDELIVER_CONNECT_INTENT = "redeliver_connect_intent";
+    public static final String EXTRAS_MIN_CONNECTION_ATTEMPT_INTERVAL =
+            "minimum_connection_attempt_interval";
     public static final String EXTRAS_CERTIFICATE = "certificate";
     public static final String EXTRAS_CERTIFICATE_PASSWORD = "certificate_password";
     public static final String EXTRAS_DETECTION_THRESHOLD = "detection_threshold";
@@ -161,8 +168,20 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
 
     private boolean mReconnecting;
     private boolean mReconnectOnAllErrors;
+    private boolean mRedeliverConnectIntent;
+    private long mMinimumConnectionAttemptIntervalMs;
     private int mConsecutiveReconnectAttempts;
+    private long mLastConnectionAttemptElapsedRealtime = -1L;
+    private boolean mDeferredConnectScheduled;
     private volatile long mLastAudioPacketSentElapsedRealtime;
+
+    private final Runnable mDeferredConnect = new Runnable() {
+        @Override
+        public void run() {
+            mDeferredConnectScheduled = false;
+            connect();
+        }
+    };
 
     /**
      * Listen for connectivity changes in the reconnection state, and reconnect accordingly.
@@ -282,7 +301,7 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
 
         // Managed radios must recover after Android kills the service process. Redelivering the
         // validated connection intent restores the same in-memory-only server/token configuration.
-        return mReconnectOnAllErrors ? START_REDELIVER_INTENT : START_NOT_STICKY;
+        return mRedeliverConnectIntent ? START_REDELIVER_INTENT : START_NOT_STICKY;
     }
 
     @Override
@@ -312,6 +331,7 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
     @Override
     public void onDestroy() {
         super.onDestroy();
+        cancelDeferredConnect();
         try {
             unregisterReceiver(mBluetoothReceiver);
         } catch (IllegalArgumentException e) {
@@ -324,8 +344,23 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
     }
 
     protected void connect() {
+        if (mConnectionState == ConnectionState.CONNECTING) {
+            return;
+        }
+
+        long throttleDelay = getConnectionAttemptThrottleDelayMs();
+        if (throttleDelay > 0L) {
+            if (!mDeferredConnectScheduled) {
+                mDeferredConnectScheduled = true;
+                Log.v(TAG, "Deferring connection attempt for " + throttleDelay + " ms.");
+                mHandler.postDelayed(mDeferredConnect, throttleDelay);
+            }
+            return;
+        }
+
         try {
             setReconnecting(false);
+            recordConnectionAttempt();
             mConnectionState = ConnectionState.DISCONNECTED;
             mVoiceTargetId = 0;
             mWhisperTargetList.clear();
@@ -352,6 +387,7 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
     }
 
     public void disconnect() {
+        setReconnecting(false);
         if (mConnection != null) {
             mConnection.disconnect();
         }
@@ -487,6 +523,9 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
     }
 
     public void setReconnecting(boolean reconnecting) {
+        if (!reconnecting) {
+            cancelDeferredConnect();
+        }
         if (mReconnecting == reconnecting)
             return;
 
@@ -525,6 +564,47 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
                 Log.e(TAG, "Error unregistering connectivity receiver: " + e.getMessage());
             }
         }
+    }
+
+    private long getConnectionAttemptThrottleDelayMs() {
+        if (mMinimumConnectionAttemptIntervalMs <= 0L) {
+            return 0L;
+        }
+
+        long elapsedDelay = ConnectionRetryPolicy.remainingAttemptDelayMs(
+                mMinimumConnectionAttemptIntervalMs,
+                SystemClock.elapsedRealtime(),
+                mLastConnectionAttemptElapsedRealtime);
+
+        SharedPreferences guard = getSharedPreferences(
+                CONNECTION_GUARD_PREFERENCES, MODE_PRIVATE);
+        long now = System.currentTimeMillis();
+        long persistedAttempt = guard.getLong(PREF_LAST_CONNECTION_ATTEMPT_MS, -1L);
+        if (persistedAttempt > now) {
+            guard.edit().remove(PREF_LAST_CONNECTION_ATTEMPT_MS).commit();
+            persistedAttempt = -1L;
+        }
+        long persistedDelay = ConnectionRetryPolicy.remainingAttemptDelayMs(
+                mMinimumConnectionAttemptIntervalMs, now, persistedAttempt);
+        return Math.max(elapsedDelay, persistedDelay);
+    }
+
+    private void recordConnectionAttempt() {
+        if (mMinimumConnectionAttemptIntervalMs <= 0L) {
+            return;
+        }
+        mLastConnectionAttemptElapsedRealtime = SystemClock.elapsedRealtime();
+        getSharedPreferences(CONNECTION_GUARD_PREFERENCES, MODE_PRIVATE)
+                .edit()
+                .putLong(PREF_LAST_CONNECTION_ATTEMPT_MS, System.currentTimeMillis())
+                .commit();
+    }
+
+    private void cancelDeferredConnect() {
+        if (mHandler != null) {
+            mHandler.removeCallbacks(mDeferredConnect);
+        }
+        mDeferredConnectScheduled = false;
     }
 
     /**
@@ -576,6 +656,13 @@ public class HumlaService extends Service implements IHumlaService, IHumlaSessio
         }
         if (extras.containsKey(EXTRAS_RECONNECT_ON_ALL_ERRORS)) {
             mReconnectOnAllErrors = extras.getBoolean(EXTRAS_RECONNECT_ON_ALL_ERRORS);
+        }
+        if (extras.containsKey(EXTRAS_REDELIVER_CONNECT_INTENT)) {
+            mRedeliverConnectIntent = extras.getBoolean(EXTRAS_REDELIVER_CONNECT_INTENT);
+        }
+        if (extras.containsKey(EXTRAS_MIN_CONNECTION_ATTEMPT_INTERVAL)) {
+            mMinimumConnectionAttemptIntervalMs = Math.max(0L,
+                    extras.getLong(EXTRAS_MIN_CONNECTION_ATTEMPT_INTERVAL));
         }
         if (extras.containsKey(EXTRAS_CERTIFICATE)) {
             mCertificate = extras.getByteArray(EXTRAS_CERTIFICATE);
